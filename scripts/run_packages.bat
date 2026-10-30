@@ -2,14 +2,14 @@
 set MAIN="%~dp0..\src\main.py"
 set URL=https://api.nuget.org/v3/index.json
 
-echo === Serilog (several dependencies) ===
-python %MAIN% -p Serilog -r %URL%
+echo === Serilog, max depth 3 ===
+python %MAIN% -p Serilog -r %URL% -d 3
 echo.
-echo === Polly (one dependency) ===
-python %MAIN% -p Polly -r %URL%
+echo === xunit, max depth 2 ===
+python %MAIN% -p xunit -r %URL% -d 2
 echo.
 echo === System.ValueTuple (no dependencies) ===
 python %MAIN% -p System.ValueTuple -r %URL%
 echo.
-echo === package name in other letter case ===
-python %MAIN% -p newtonsoft.json -r %URL%
+echo === Newtonsoft.Json, max depth 1 (only direct dependencies) ===
+python %MAIN% -p Newtonsoft.Json -r %URL% -d 1

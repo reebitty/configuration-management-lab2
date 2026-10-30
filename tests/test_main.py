@@ -8,10 +8,17 @@ from unittest.mock import patch
 from src.main import (
     NotFoundError,
     NuGetError,
+    RepoError,
+    build_graph,
+    fetch,
     find_package_base,
+    load_test_repo,
     main,
+    make_nuget_resolver,
+    make_test_resolver,
     parse_args,
     parse_dependencies,
+    parse_test_line,
     select_version,
     validate_max_depth,
     validate_output,
@@ -19,8 +26,10 @@ from src.main import (
     validate_repo,
 )
 
-TEST_REPO = os.path.join(os.path.dirname(__file__), "..", "repos",
-                         "test_repo.txt")
+REPOS = os.path.join(os.path.dirname(__file__), "..", "repos")
+TEST_REPO = os.path.join(REPOS, "test_repo.txt")
+CYCLE_REPO = os.path.join(REPOS, "cycle.txt")
+CHAIN_REPO = os.path.join(REPOS, "chain.txt")
 URL = "https://api.nuget.org/v3/index.json"
 BASE = "https://example.org/flat/"
 INDEX = {"resources": [
@@ -152,15 +161,36 @@ class TestNuGet(unittest.TestCase):
         with self.assertRaises(NuGetError):
             parse_dependencies(b"not xml")
 
-    def test_main_prints_dependencies(self) -> None:
-        """Тест вывода прямых зависимостей пакета."""
+    def test_fetch_retries_on_network_error(self) -> None:
+        """Тест повтора запроса при сбое сети и без повтора при 404."""
+        with patch("src.main.fetch_once",
+                   side_effect=[OSError("eof"), OSError("eof"), b"ok"]):
+            self.assertEqual(fetch(URL), b"ok")
+        with patch("src.main.fetch_once", side_effect=OSError("eof")):
+            with self.assertRaises(NuGetError):
+                fetch(URL)
+        with patch("src.main.fetch_once",
+                   side_effect=NotFoundError("нет")) as fetch_once:
+            with self.assertRaises(NotFoundError):
+                fetch(URL)
+            self.assertEqual(fetch_once.call_count, 1)
+
+    def test_nuget_resolver(self) -> None:
+        """Тест получения имен прямых зависимостей с кэшированием."""
+        with patch("src.main.fetch", side_effect=fake_fetch) as fetch:
+            resolver = make_nuget_resolver(URL)
+            self.assertEqual(resolver("Demo"), ["Lib.A", "lib.b"])
+            calls = fetch.call_count
+            self.assertEqual(resolver("DEMO"), ["Lib.A", "lib.b"])
+            self.assertEqual(fetch.call_count, calls)
+
+    def test_main_nuget_graph(self) -> None:
+        """Тест вывода графа пакета из репозитория NuGet."""
         with patch("src.main.fetch", side_effect=fake_fetch):
-            code, output = run_main(["-p", "Demo", "-r", URL])
+            code, output = run_main(["-p", "Demo", "-r", URL, "-d", "1"])
         self.assertEqual(code, 0)
-        self.assertEqual(output, "Пакет: Demo 2.0.0\n"
-                                 "Прямые зависимости (2):\n"
-                                 "  Lib.A 1.0.0\n"
-                                 "  lib.b [2.0, 3.0)\n")
+        self.assertIn("Demo -> Lib.A, lib.b", output)
+        self.assertIn("Lib.A -> не анализировался", output)
 
     def test_main_package_not_found(self) -> None:
         """Тест ошибки при отсутствии пакета в репозитории."""
@@ -169,11 +199,78 @@ class TestNuGet(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("пакет 'Missing' не найден", output)
 
-    def test_main_test_mode_not_supported(self) -> None:
-        """Тест сообщения о неподдерживаемом режиме тестирования."""
-        code, output = run_main(["-p", "A", "-r", TEST_REPO, "-t"])
-        self.assertEqual(code, 1)
-        self.assertIn("--test-mode", output)
+
+def graph_of(package: str, path: str, depth: int) -> dict:
+    """Строит граф пакета из файла тестового репозитория."""
+    graph = build_graph(package, depth, make_test_resolver(path, package))
+    return {"nodes": graph.nodes, "cycles": graph.cycles}
+
+
+class TestTestRepo(unittest.TestCase):
+    """Тестирование загрузки тестового репозитория."""
+
+    def test_parse_line(self) -> None:
+        """Тест разбора строки описания пакета."""
+        self.assertEqual(parse_test_line("A: B C", 1), ("A", ["B", "C"]))
+        self.assertEqual(parse_test_line("D:", 1), ("D", []))
+        for line in ("A B", "a: B", "A: B1"):
+            with self.assertRaises(RepoError):
+                parse_test_line(line, 1)
+
+    def test_load(self) -> None:
+        """Тест загрузки файла с комментариями."""
+        self.assertEqual(load_test_repo(CHAIN_REPO)["E"], ["F"])
+        with self.assertRaises(RepoError):
+            load_test_repo("missing_repo.txt")
+
+    def test_package_not_found(self) -> None:
+        """Тест ошибки для пакета, которого нет в репозитории."""
+        with self.assertRaises(RepoError):
+            make_test_resolver(TEST_REPO, "Z")
+
+
+class TestGraph(unittest.TestCase):
+    """Тестирование построения графа алгоритмом DFS."""
+
+    def test_shared_dependency(self) -> None:
+        """Тест общей зависимости: пакет D анализируется один раз."""
+        result = graph_of("A", TEST_REPO, 3)
+        self.assertEqual(result["nodes"], {"A": ["B", "C"], "B": ["D"],
+                                           "D": [], "C": ["D"]})
+        self.assertEqual(result["cycles"], [])
+
+    def test_cycles(self) -> None:
+        """Тест обнаружения циклов, в том числе зависимости от себя."""
+        result = graph_of("A", CYCLE_REPO, 5)
+        self.assertEqual(result["cycles"], [["A", "B", "C", "A"],
+                                            ["E", "E"]])
+        self.assertEqual(len(result["nodes"]), 5)
+
+    def test_cycle_found_once(self) -> None:
+        """Тест: один и тот же цикл не дублируется."""
+        result = graph_of("C", CYCLE_REPO, 10)
+        self.assertEqual(result["cycles"].count(["A", "B", "C", "A"]), 1)
+
+    def test_max_depth(self) -> None:
+        """Тест ограничения глубины анализа."""
+        result = graph_of("A", CHAIN_REPO, 2)
+        self.assertEqual(result["nodes"], {"A": ["B"], "B": ["C"],
+                                           "C": None})
+
+    def test_shorter_path_expands_node(self) -> None:
+        """Тест: пакет, найденный глубже, раскрывается по короткому пути."""
+        repo = {"A": ["B", "D"], "B": ["C"], "C": ["D"], "D": ["E"]}
+        graph = build_graph("A", 2, lambda name: repo.get(name, []))
+        self.assertEqual(graph.nodes["D"], ["E"])
+        self.assertIsNone(graph.nodes["E"])
+
+    def test_main_output(self) -> None:
+        """Тест вывода графа и циклов на экран."""
+        code, output = run_main(["-p", "B", "-r", CYCLE_REPO, "-t"])
+        self.assertEqual(code, 0)
+        self.assertIn("D -> не анализировался", output)
+        self.assertIn("A -> B -> C -> A", output)
+        self.assertIn("Пакетов в графе: 5", output)
 
 
 class TestMain(unittest.TestCase):

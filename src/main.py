@@ -6,6 +6,8 @@ import sys
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ElementTree
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 DEFAULT_OUTPUT = "graph.svg"
@@ -17,8 +19,10 @@ URL_SCHEMES = ("http", "https")
 IMAGE_EXTENSION = ".svg"
 FORBIDDEN_FILE_CHARS = '<>:"|?*'
 REQUEST_TIMEOUT = 15
+REQUEST_ATTEMPTS = 3
 HTTP_NOT_FOUND = 404
 PACKAGE_BASE_TYPE = "PackageBaseAddress/3.0.0"
+TEST_PACKAGE_PATTERN = re.compile(r"^[A-Z]+$")
 
 
 class NuGetError(Exception):
@@ -27,6 +31,25 @@ class NuGetError(Exception):
 
 class NotFoundError(NuGetError):
     """Запрошенный ресурс отсутствует в репозитории."""
+
+
+class RepoError(Exception):
+    """Ошибка загрузки тестового репозитория."""
+
+
+@dataclass
+class DependencyGraph:
+    """Граф зависимостей: пакет -> список зависимостей.
+
+    Значение None означает, что зависимости пакета не анализировались,
+    так как достигнута максимальная глубина.
+    """
+
+    max_depth: int
+    nodes: dict[str, list[str] | None] = field(default_factory=dict)
+    depths: dict[str, int] = field(default_factory=dict)
+    cycles: list[list[str]] = field(default_factory=list)
+    cycle_keys: set[tuple[str, ...]] = field(default_factory=set)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -121,8 +144,8 @@ def validate_args(args: argparse.Namespace) -> list[str]:
     return [error for error in errors if error]
 
 
-def fetch(url: str) -> bytes:
-    """Загружает данные по URL-адресу."""
+def fetch_once(url: str) -> bytes:
+    """Выполняет один запрос по URL-адресу."""
     try:
         with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as response:
             return response.read()
@@ -131,10 +154,19 @@ def fetch(url: str) -> bytes:
             raise NotFoundError(f"ресурс не найден: {url}") from error
         raise NuGetError(
             f"сервер вернул ошибку {error.code} для {url}") from error
-    except OSError as error:
-        reason = getattr(error, "reason", error)
-        raise NuGetError(
-            f"не удалось подключиться к {url}: {reason}") from error
+
+
+def fetch(url: str) -> bytes:
+    """Загружает данные по URL-адресу, повторяя запрос при сбое сети."""
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        try:
+            return fetch_once(url)
+        except OSError as error:
+            if attempt == REQUEST_ATTEMPTS:
+                reason = getattr(error, "reason", error)
+                raise NuGetError(
+                    f"не удалось подключиться к {url}: {reason}") from error
+    raise NuGetError(f"не удалось подключиться к {url}")
 
 
 def fetch_json(url: str) -> dict:
@@ -191,52 +223,155 @@ def parse_dependencies(nuspec: bytes) -> list[tuple[str, str]]:
     return [dependencies[key] for key in sorted(dependencies)]
 
 
-def get_direct_dependencies(
-        repo_url: str, package: str) -> tuple[str, list[tuple[str, str]]]:
-    """Возвращает версию пакета и его прямые зависимости."""
+def make_nuget_resolver(repo_url: str) -> Callable[[str], list[str]]:
+    """Создает функцию получения прямых зависимостей пакета из NuGet."""
     try:
         index = fetch_json(repo_url)
     except NotFoundError as error:
         raise NuGetError(
             f"индекс сервиса NuGet не найден по адресу {repo_url}") from error
     base = find_package_base(index)
-    version = select_version(get_versions(base, package))
-    package_id = package.lower()
-    nuspec = fetch(f"{base}{package_id}/{version.lower()}/"
-                   f"{package_id}.nuspec")
-    return version, parse_dependencies(nuspec)
+    cache: dict[str, list[str]] = {}
+
+    def get_dependencies(package: str) -> list[str]:
+        """Возвращает имена прямых зависимостей последней версии пакета."""
+        package_id = package.lower()
+        if package_id not in cache:
+            version = select_version(get_versions(base, package))
+            nuspec = fetch(f"{base}{package_id}/{version.lower()}/"
+                           f"{package_id}.nuspec")
+            cache[package_id] = [name for name, _ in
+                                 parse_dependencies(nuspec)]
+        return cache[package_id]
+
+    return get_dependencies
 
 
-def print_dependencies(package: str, version: str,
-                       dependencies: list[tuple[str, str]]) -> None:
-    """Выводит прямые зависимости пакета."""
-    print(f"Пакет: {package} {version}")
-    if not dependencies:
-        print("Прямые зависимости: нет")
+def parse_test_line(line: str, number: int) -> tuple[str, list[str]]:
+    """Разбирает строку тестового репозитория вида 'A: B C'."""
+    if ":" not in line:
+        raise RepoError(f"строка {number}: ожидается формат "
+                        "'ПАКЕТ: ЗАВИСИМОСТИ'")
+    name, _, rest = line.partition(":")
+    names = [name.strip()] + rest.split()
+    for package in names:
+        if not TEST_PACKAGE_PATTERN.match(package):
+            raise RepoError(f"строка {number}: недопустимое имя пакета "
+                            f"'{package}' (только большие латинские буквы)")
+    return names[0], names[1:]
+
+
+def load_test_repo(path: str) -> dict[str, list[str]]:
+    """Загружает граф тестового репозитория из файла."""
+    try:
+        with open(path, encoding="utf-8-sig") as file:
+            lines = file.readlines()
+    except OSError as error:
+        raise RepoError(f"не удалось открыть файл тестового репозитория "
+                        f"'{path}': {error.strerror}") from error
+    repo: dict[str, list[str]] = {}
+    for number, line in enumerate(lines, start=1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, dependencies = parse_test_line(line, number)
+        if name in repo:
+            raise RepoError(f"строка {number}: пакет '{name}' описан "
+                            "повторно")
+        repo[name] = dependencies
+    return repo
+
+
+def make_test_resolver(path: str,
+                       package: str) -> Callable[[str], list[str]]:
+    """Создает функцию получения зависимостей из тестового репозитория."""
+    repo = load_test_repo(path)
+    known = set(repo)
+    for dependencies in repo.values():
+        known.update(dependencies)
+    if package not in known:
+        raise RepoError(f"пакет '{package}' не найден в тестовом "
+                        "репозитории")
+    return lambda name: repo.get(name, [])
+
+
+def add_cycle(graph: DependencyGraph, cycle: list[str]) -> None:
+    """Добавляет найденный цикл в граф, если он еще не был найден."""
+    nodes = cycle[:-1]
+    start = nodes.index(min(nodes))
+    key = tuple(nodes[start:] + nodes[:start])
+    if key not in graph.cycle_keys:
+        graph.cycle_keys.add(key)
+        graph.cycles.append(list(key) + [key[0]])
+
+
+def visit(graph: DependencyGraph, package: str, depth: int,
+          path: list[str],
+          get_dependencies: Callable[[str], list[str]]) -> None:
+    """Рекурсивно обходит зависимости пакета в глубину (DFS)."""
+    if package in path:
+        add_cycle(graph, path[path.index(package):] + [package])
         return
-    print(f"Прямые зависимости ({len(dependencies)}):")
-    for name, version_range in dependencies:
-        print(f"  {name} {version_range}".rstrip())
+    if package in graph.depths and graph.depths[package] <= depth:
+        return
+    graph.depths[package] = depth
+    if depth >= graph.max_depth:
+        graph.nodes.setdefault(package, None)
+        return
+    dependencies = get_dependencies(package)
+    graph.nodes[package] = dependencies
+    path.append(package)
+    for dependency in dependencies:
+        visit(graph, dependency, depth + 1, path, get_dependencies)
+    path.pop()
+
+
+def build_graph(package: str, max_depth: int,
+                get_dependencies: Callable[[str], list[str]]
+                ) -> DependencyGraph:
+    """Строит граф зависимостей пакета с учетом транзитивности."""
+    graph = DependencyGraph(max_depth)
+    visit(graph, package, 0, [], get_dependencies)
+    return graph
+
+
+def print_graph(package: str, graph: DependencyGraph) -> None:
+    """Выводит граф зависимостей и найденные циклы."""
+    print(f"Граф зависимостей пакета {package} "
+          f"(максимальная глубина: {graph.max_depth})")
+    for name, dependencies in graph.nodes.items():
+        if dependencies is None:
+            print(f"  {name} -> не анализировался "
+                  "(достигнута максимальная глубина)")
+        else:
+            print(f"  {name} -> {', '.join(dependencies) or 'нет'}")
+    print(f"Пакетов в графе: {len(graph.nodes)}")
+    if not graph.cycles:
+        print("Циклические зависимости: нет")
+        return
+    print(f"Циклические зависимости ({len(graph.cycles)}):")
+    for cycle in graph.cycles:
+        print("  " + " -> ".join(cycle))
 
 
 def main(argv: list[str] | None = None) -> int:
     """Точка входа. Возвращает код завершения программы."""
     args = parse_args(argv)
     errors = validate_args(args)
-    if args.test_mode:
-        errors.append("режим тестового репозитория пока не поддерживается: "
-                      "укажите URL-адрес репозитория (--test-mode)")
     if errors:
         for error in errors:
             print(f"Ошибка: {error}")
         return 1
     try:
-        version, dependencies = get_direct_dependencies(args.repo,
-                                                        args.package)
-    except NuGetError as error:
+        if args.test_mode:
+            resolver = make_test_resolver(args.repo, args.package)
+        else:
+            resolver = make_nuget_resolver(args.repo)
+        graph = build_graph(args.package, int(args.max_depth), resolver)
+    except (NuGetError, RepoError) as error:
         print(f"Ошибка: {error}")
         return 1
-    print_dependencies(args.package, version, dependencies)
+    print_graph(args.package, graph)
     return 0
 
 

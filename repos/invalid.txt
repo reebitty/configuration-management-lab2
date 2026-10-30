@@ -1,0 +1,3 @@
+# Invalid package name in line 3 (only capital Latin letters are allowed)
+A: B C
+B: c

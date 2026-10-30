@@ -1,0 +1,6 @@
+# Cyclic dependencies: A -> B -> C -> A and self-dependency E -> E
+A: B D
+B: C
+C: A E
+D: E
+E: E

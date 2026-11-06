@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -23,6 +24,8 @@ REQUEST_ATTEMPTS = 3
 HTTP_NOT_FOUND = 404
 PACKAGE_BASE_TYPE = "PackageBaseAddress/3.0.0"
 TEST_PACKAGE_PATTERN = re.compile(r"^[A-Z]+$")
+GRAPHVIZ_COMMAND = "dot"
+GRAPHVIZ_TIMEOUT = 60
 
 
 class NuGetError(Exception):
@@ -35,6 +38,10 @@ class NotFoundError(NuGetError):
 
 class RepoError(Exception):
     """Ошибка загрузки тестового репозитория."""
+
+
+class VisualizationError(Exception):
+    """Ошибка построения изображения графа."""
 
 
 @dataclass
@@ -72,10 +79,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=str(DEFAULT_MAX_DEPTH),
                         help="максимальная глубина анализа зависимостей "
                              f"(по умолчанию {DEFAULT_MAX_DEPTH})")
-    parser.add_argument("-R", "--reverse", action="store_true",
-                        help="вывод обратных зависимостей: пакетов, "
-                             "которые зависят от заданного пакета "
-                             "(только с --test-mode)")
     return parser.parse_args(argv)
 
 
@@ -137,14 +140,6 @@ def validate_max_depth(value: str) -> str | None:
     return None
 
 
-def validate_reverse(reverse: bool, test_mode: bool) -> str | None:
-    """Проверяет, что обратные зависимости ищутся в тестовом репозитории."""
-    if reverse and not test_mode:
-        return ("режим обратных зависимостей поддерживается только для "
-                "тестового репозитория: укажите --test-mode (--reverse)")
-    return None
-
-
 def validate_args(args: argparse.Namespace) -> list[str]:
     """Проверяет все параметры и возвращает список ошибок."""
     errors = [
@@ -152,7 +147,6 @@ def validate_args(args: argparse.Namespace) -> list[str]:
         validate_repo(args.repo, args.test_mode),
         validate_output(args.output),
         validate_max_depth(args.max_depth),
-        validate_reverse(args.reverse, args.test_mode),
     ]
     return [error for error in errors if error]
 
@@ -295,22 +289,9 @@ def load_test_repo(path: str) -> dict[str, list[str]]:
     return repo
 
 
-def reverse_repo(repo: dict[str, list[str]]) -> dict[str, list[str]]:
-    """Переворачивает граф: пакет -> пакеты, которые от него зависят."""
-    dependents: dict[str, list[str]] = {}
-    for name, dependencies in repo.items():
-        for dependency in dependencies:
-            dependents.setdefault(dependency, []).append(name)
-    return {name: sorted(names) for name, names in dependents.items()}
-
-
-def make_test_resolver(path: str, package: str,
-                       reverse: bool = False) -> Callable[[str], list[str]]:
-    """Создает функцию получения зависимостей из тестового репозитория.
-
-    При reverse=True функция возвращает обратные зависимости: пакеты,
-    которые напрямую зависят от заданного пакета.
-    """
+def make_test_resolver(path: str,
+                       package: str) -> Callable[[str], list[str]]:
+    """Создает функцию получения зависимостей из тестового репозитория."""
     repo = load_test_repo(path)
     known = set(repo)
     for dependencies in repo.values():
@@ -318,8 +299,6 @@ def make_test_resolver(path: str, package: str,
     if package not in known:
         raise RepoError(f"пакет '{package}' не найден в тестовом "
                         "репозитории")
-    if reverse:
-        repo = reverse_repo(repo)
     return lambda name: repo.get(name, [])
 
 
@@ -386,33 +365,122 @@ def build_graph(package: str, max_depth: int,
     return graph
 
 
-def print_graph(package: str, graph: DependencyGraph,
-                reverse: bool = False) -> None:
-    """Выводит граф зависимостей (или обратных зависимостей) и циклы.
-
-    В режиме обратных зависимостей запись 'X <- Y, Z' означает,
-    что пакеты Y и Z зависят от пакета X.
-    """
-    title = "Обратные зависимости" if reverse else "Граф зависимостей"
-    arrow = " <- " if reverse else " -> "
-    print(f"{title} пакета {package} "
+def print_graph(package: str, graph: DependencyGraph) -> None:
+    """Выводит граф зависимостей и найденные циклы."""
+    print(f"Граф зависимостей пакета {package} "
           f"(максимальная глубина: {graph.max_depth})")
     for name, dependencies in graph.nodes.items():
         if dependencies is None:
-            print(f"  {name}{arrow}не анализировался "
+            print(f"  {name} -> не анализировался "
                   "(достигнута максимальная глубина)")
         else:
-            print(f"  {name}{arrow}{', '.join(dependencies) or 'нет'}")
-    if reverse:
-        print(f"Пакетов, зависящих от {package}: {len(graph.nodes) - 1}")
-    else:
-        print(f"Пакетов в графе: {len(graph.nodes)}")
+            print(f"  {name} -> {', '.join(dependencies) or 'нет'}")
+    print(f"Пакетов в графе: {len(graph.nodes)}")
     if not graph.cycles:
         print("Циклические зависимости: нет")
         return
     print(f"Циклические зависимости ({len(graph.cycles)}):")
     for cycle in graph.cycles:
-        print("  " + arrow.join(cycle))
+        print("  " + " -> ".join(cycle))
+
+
+def quote(name: str) -> str:
+    """Записывает имя пакета как строку языка Graphviz."""
+    return '"' + name.replace('"', '\\"') + '"'
+
+
+def make_dot(package: str, graph: DependencyGraph) -> str:
+    """Формирует описание графа на языке диаграмм Graphviz (DOT).
+
+    Анализируемый пакет закрашен, пакеты, которые не анализировались
+    из-за ограничения глубины, обведены пунктиром, ребра циклов красные.
+    """
+    cycle_edges = {edge for cycle in graph.cycles
+                   for edge in zip(cycle, cycle[1:])}
+    lines = [f"digraph {quote(package)} {{",
+             "    node [shape=box];",
+             f"    {quote(package)} [style=filled, fillcolor=lightblue];"]
+    for name, dependencies in graph.nodes.items():
+        if dependencies is None:
+            lines.append(f"    {quote(name)} [style=dashed];")
+            continue
+        for dependency in dependencies:
+            color = (" [color=red]" if (name, dependency) in cycle_edges
+                     else "")
+            lines.append(f"    {quote(name)} -> {quote(dependency)}"
+                         f"{color};")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def save_svg(dot_text: str, output: str) -> None:
+    """Сохраняет изображение графа в файл SVG с помощью Graphviz (dot)."""
+    try:
+        subprocess.run([GRAPHVIZ_COMMAND, "-Tsvg", "-o", output],
+                       input=dot_text.encode("utf-8"), capture_output=True,
+                       check=True, timeout=GRAPHVIZ_TIMEOUT)
+    except FileNotFoundError as error:
+        raise VisualizationError(
+            "программа Graphviz (dot) не найдена: установите Graphviz "
+            "и добавьте его в переменную PATH") from error
+    except subprocess.CalledProcessError as error:
+        message = error.stderr.decode("utf-8", errors="replace").strip()
+        raise VisualizationError(
+            f"Graphviz завершился с ошибкой: {message}") from error
+    except subprocess.TimeoutExpired as error:
+        raise VisualizationError(
+            "Graphviz не успел построить изображение графа") from error
+
+
+def tree_note(graph: DependencyGraph, package: str, path: list[str],
+              shown: set[str]) -> str:
+    """Возвращает пометку для пакета в ASCII-дереве (или пустую строку)."""
+    if package in path:
+        return " (цикл)"
+    if graph.nodes.get(package) is None:
+        return " (не анализировался)"
+    if package in shown and graph.nodes[package]:
+        return " (см. выше)"
+    return ""
+
+
+def print_tree_children(graph: DependencyGraph, package: str, prefix: str,
+                        path: list[str], shown: set[str]) -> None:
+    """Рекурсивно выводит зависимости пакета ветками ASCII-дерева."""
+    shown.add(package)
+    dependencies = graph.nodes.get(package) or []
+    last_index = len(dependencies) - 1
+    for index, dependency in enumerate(dependencies):
+        is_last = index == last_index
+        note = tree_note(graph, dependency, path, shown)
+        print(f"{prefix}{'`-- ' if is_last else '|-- '}{dependency}{note}")
+        if not note:
+            print_tree_children(graph, dependency,
+                                prefix + ("    " if is_last else "|   "),
+                                path + [dependency], shown)
+
+
+def print_ascii_tree(package: str, graph: DependencyGraph) -> None:
+    """Выводит зависимости пакета в виде ASCII-дерева."""
+    print(package)
+    print_tree_children(graph, package, "", [package], set())
+
+
+def visualize(args: argparse.Namespace, graph: DependencyGraph) -> int:
+    """Выводит описание на языке Graphviz, ASCII-дерево и сохраняет SVG."""
+    dot_text = make_dot(args.package, graph)
+    print("\nОписание графа на языке Graphviz:")
+    print(dot_text, end="")
+    if args.ascii_tree:
+        print("\nASCII-дерево зависимостей:")
+        print_ascii_tree(args.package, graph)
+    try:
+        save_svg(dot_text, args.output)
+    except VisualizationError as error:
+        print(f"Ошибка: {error}")
+        return 1
+    print(f"\nИзображение графа сохранено в файл {args.output}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -425,16 +493,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         if args.test_mode:
-            resolver = make_test_resolver(args.repo, args.package,
-                                          args.reverse)
+            resolver = make_test_resolver(args.repo, args.package)
         else:
             resolver = make_nuget_resolver(args.repo)
         graph = build_graph(args.package, int(args.max_depth), resolver)
     except (NuGetError, RepoError) as error:
         print(f"Ошибка: {error}")
         return 1
-    print_graph(args.package, graph, args.reverse)
-    return 0
+    print_graph(args.package, graph)
+    return visualize(args, graph)
 
 
 if __name__ == "__main__":

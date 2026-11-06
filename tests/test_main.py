@@ -9,18 +9,20 @@ from src.main import (
     NotFoundError,
     NuGetError,
     RepoError,
+    VisualizationError,
     build_graph,
     fetch,
     find_package_base,
     load_test_repo,
     main,
+    make_dot,
     make_nuget_resolver,
     make_test_resolver,
     parse_args,
     parse_dependencies,
     parse_test_line,
-    reverse_repo,
-    validate_reverse,
+    print_ascii_tree,
+    save_svg,
     select_version,
     validate_max_depth,
     validate_output,
@@ -32,7 +34,6 @@ REPOS = os.path.join(os.path.dirname(__file__), "..", "repos")
 TEST_REPO = os.path.join(REPOS, "test_repo.txt")
 CYCLE_REPO = os.path.join(REPOS, "cycle.txt")
 CHAIN_REPO = os.path.join(REPOS, "chain.txt")
-LIBRARY_REPO = os.path.join(REPOS, "library.txt")
 URL = "https://api.nuget.org/v3/index.json"
 BASE = "https://example.org/flat/"
 INDEX = {"resources": [
@@ -69,11 +70,20 @@ def fake_fetch(url: str) -> bytes:
 
 
 def run_main(argv: list[str]) -> tuple[int, str]:
-    """Запускает приложение и возвращает код завершения и вывод."""
+    """Запускает приложение (без вызова Graphviz) и возвращает вывод."""
     output = io.StringIO()
-    with redirect_stdout(output):
+    with redirect_stdout(output), patch("src.main.save_svg"):
         code = main(argv)
     return code, output.getvalue()
+
+
+def tree_of(package: str, path: str, depth: int) -> str:
+    """Возвращает ASCII-дерево пакета из тестового репозитория."""
+    graph = build_graph(package, depth, make_test_resolver(path, package))
+    output = io.StringIO()
+    with redirect_stdout(output):
+        print_ascii_tree(package, graph)
+    return output.getvalue()
 
 
 class TestParseArgs(unittest.TestCase):
@@ -284,64 +294,99 @@ class TestGraph(unittest.TestCase):
         self.assertIn("Пакетов в графе: 5", output)
 
 
-def reverse_graph_of(package: str, path: str, depth: int) -> dict:
-    """Строит граф обратных зависимостей пакета из тестового файла."""
-    resolver = make_test_resolver(path, package, reverse=True)
-    graph = build_graph(package, depth, resolver)
-    return {"nodes": graph.nodes, "cycles": graph.cycles}
+class TestVisualization(unittest.TestCase):
+    """Тестирование визуализации графа (этап 5)."""
 
+    def test_make_dot(self) -> None:
+        """Тест описания графа на языке Graphviz."""
+        graph = build_graph("A", 3, make_test_resolver(TEST_REPO, "A"))
+        self.assertEqual(make_dot("A", graph),
+                         'digraph "A" {\n'
+                         "    node [shape=box];\n"
+                         '    "A" [style=filled, fillcolor=lightblue];\n'
+                         '    "A" -> "B";\n'
+                         '    "A" -> "C";\n'
+                         '    "B" -> "D";\n'
+                         '    "C" -> "D";\n'
+                         "}\n")
 
-class TestReverse(unittest.TestCase):
-    """Тестирование режима обратных зависимостей."""
+    def test_make_dot_cycles_and_depth(self) -> None:
+        """Тест: ребра циклов красные, неанализированные пакеты пунктиром."""
+        graph = build_graph("B", 3, make_test_resolver(CYCLE_REPO, "B"))
+        dot = make_dot("B", graph)
+        self.assertIn('"A" -> "B" [color=red];', dot)
+        self.assertIn('"E" -> "E" [color=red];', dot)
+        self.assertIn('"A" -> "D";', dot)
+        self.assertIn('"D" [style=dashed];', dot)
 
-    def test_reverse_repo(self) -> None:
-        """Тест переворота графа: пакет -> кто от него зависит."""
-        repo = {"A": ["B", "C"], "B": ["C"], "C": []}
-        self.assertEqual(reverse_repo(repo), {"B": ["A"], "C": ["A", "B"]})
+    def test_ascii_tree(self) -> None:
+        """Тест ASCII-дерева с повторной зависимостью."""
+        self.assertEqual(tree_of("A", TEST_REPO, 3),
+                         "A\n"
+                         "|-- B\n"
+                         "|   `-- D\n"
+                         "`-- C\n"
+                         "    `-- D\n")
 
-    def test_shared_dependency(self) -> None:
-        """Тест: от D зависят B и C напрямую и A транзитивно."""
-        result = reverse_graph_of("D", TEST_REPO, 3)
-        self.assertEqual(result["nodes"], {"D": ["B", "C"], "B": ["A"],
-                                           "A": [], "C": ["A"]})
+    def test_ascii_tree_cycles_and_depth(self) -> None:
+        """Тест пометок цикла и неанализированного пакета в дереве."""
+        self.assertEqual(tree_of("B", CYCLE_REPO, 3),
+                         "B\n"
+                         "`-- C\n"
+                         "    |-- A\n"
+                         "    |   |-- B (цикл)\n"
+                         "    |   `-- D (не анализировался)\n"
+                         "    `-- E\n"
+                         "        `-- E (цикл)\n")
 
-    def test_direct_and_transitive(self) -> None:
-        """Тест прямых и транзитивных обратных зависимостей."""
-        result = reverse_graph_of("L", LIBRARY_REPO, 10)
-        self.assertEqual(set(result["nodes"]),
-                         {"L", "A", "B", "C", "D", "E", "F", "G"})
-        self.assertEqual(result["nodes"]["L"], ["B", "D", "E"])
+    def test_ascii_tree_shown_above(self) -> None:
+        """Тест: уже выведенная ветка не повторяется."""
+        repo = {"A": ["B", "C"], "B": ["D"], "C": ["B"], "D": []}
+        graph = build_graph("A", 5, lambda name: repo.get(name, []))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_ascii_tree("A", graph)
+        self.assertIn("    `-- B (см. выше)", output.getvalue())
 
-    def test_max_depth(self) -> None:
-        """Тест ограничения глубины: только прямые обратные зависимости."""
-        result = reverse_graph_of("L", LIBRARY_REPO, 1)
-        self.assertEqual(result["nodes"], {"L": ["B", "D", "E"], "B": None,
-                                           "D": None, "E": None})
+    def test_save_svg(self) -> None:
+        """Тест вызова Graphviz для сохранения SVG."""
+        with patch("src.main.subprocess.run") as run:
+            save_svg("digraph {}", "graph.svg")
+        self.assertEqual(run.call_args.args[0],
+                         ["dot", "-Tsvg", "-o", "graph.svg"])
+        self.assertEqual(run.call_args.kwargs["input"], b"digraph {}")
 
-    def test_no_dependents(self) -> None:
-        """Тест пакета, от которого никто не зависит."""
-        self.assertEqual(reverse_graph_of("F", LIBRARY_REPO, 3)["nodes"],
-                         {"F": []})
+    def test_save_svg_without_graphviz(self) -> None:
+        """Тест ошибки, если Graphviz не установлен."""
+        with patch("src.main.subprocess.run",
+                   side_effect=FileNotFoundError):
+            with self.assertRaises(VisualizationError):
+                save_svg("digraph {}", "graph.svg")
 
-    def test_cycles(self) -> None:
-        """Тест циклов в графе обратных зависимостей."""
-        result = reverse_graph_of("E", CYCLE_REPO, 3)
-        self.assertIn(["E", "E"], result["cycles"])
-        self.assertIn(["A", "C", "B", "A"], result["cycles"])
-
-    def test_validate_reverse(self) -> None:
-        """Тест: режим обратных зависимостей только для тестового режима."""
-        self.assertIsNone(validate_reverse(True, True))
-        self.assertIsNone(validate_reverse(False, False))
-        self.assertIsNotNone(validate_reverse(True, False))
-
-    def test_main_output(self) -> None:
-        """Тест вывода обратных зависимостей на экран."""
-        code, output = run_main(["-p", "D", "-r", TEST_REPO, "-t", "-R"])
+    def test_main_visualization(self) -> None:
+        """Тест вывода описания Graphviz, дерева и сохранения SVG."""
+        code, output = run_main(["-p", "A", "-r", TEST_REPO, "-t", "-a",
+                                 "-o", "test.svg"])
         self.assertEqual(code, 0)
-        self.assertIn("Обратные зависимости пакета D", output)
-        self.assertIn("D <- B, C", output)
-        self.assertIn("Пакетов, зависящих от D: 3", output)
+        self.assertIn('digraph "A" {', output)
+        self.assertIn("ASCII-дерево зависимостей:", output)
+        self.assertIn("сохранено в файл test.svg", output)
+
+    def test_main_without_ascii_tree(self) -> None:
+        """Тест: без параметра --ascii-tree дерево не выводится."""
+        code, output = run_main(["-p", "A", "-r", TEST_REPO, "-t"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("ASCII-дерево", output)
+
+    def test_main_graphviz_error(self) -> None:
+        """Тест кода завершения 1 при ошибке Graphviz."""
+        output = io.StringIO()
+        with redirect_stdout(output), patch(
+                "src.main.save_svg",
+                side_effect=VisualizationError("dot не найден")):
+            code = main(["-p", "A", "-r", TEST_REPO, "-t"])
+        self.assertEqual(code, 1)
+        self.assertIn("Ошибка: dot не найден", output.getvalue())
 
 
 class TestMain(unittest.TestCase):

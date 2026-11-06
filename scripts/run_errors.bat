@@ -49,3 +49,6 @@ python %MAIN% --package Z --repo "%~dp0..\repos\test_repo.txt" --test-mode
 echo.
 echo === 16. Invalid test repository file ===
 python %MAIN% --package A --repo "%~dp0..\repos\invalid.txt" --test-mode
+echo.
+echo === 17. Reverse dependencies without test mode ===
+python %MAIN% --package Serilog --repo %URL% --reverse

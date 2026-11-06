@@ -19,6 +19,8 @@ from src.main import (
     parse_args,
     parse_dependencies,
     parse_test_line,
+    reverse_repo,
+    validate_reverse,
     select_version,
     validate_max_depth,
     validate_output,
@@ -30,6 +32,7 @@ REPOS = os.path.join(os.path.dirname(__file__), "..", "repos")
 TEST_REPO = os.path.join(REPOS, "test_repo.txt")
 CYCLE_REPO = os.path.join(REPOS, "cycle.txt")
 CHAIN_REPO = os.path.join(REPOS, "chain.txt")
+LIBRARY_REPO = os.path.join(REPOS, "library.txt")
 URL = "https://api.nuget.org/v3/index.json"
 BASE = "https://example.org/flat/"
 INDEX = {"resources": [
@@ -264,6 +267,14 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(graph.nodes["D"], ["E"])
         self.assertIsNone(graph.nodes["E"])
 
+    def test_cycle_after_shorter_path(self) -> None:
+        """Тест: цикл находится, даже если он не лежал на одном пути."""
+        repo = {"S": ["C", "D"], "C": ["B"], "B": ["A"], "D": ["A"],
+                "A": ["C"]}
+        graph = build_graph("S", 3, lambda name: repo.get(name, []))
+        self.assertEqual(graph.nodes["A"], ["C"])
+        self.assertEqual(graph.cycles, [["A", "C", "B", "A"]])
+
     def test_main_output(self) -> None:
         """Тест вывода графа и циклов на экран."""
         code, output = run_main(["-p", "B", "-r", CYCLE_REPO, "-t"])
@@ -271,6 +282,66 @@ class TestGraph(unittest.TestCase):
         self.assertIn("D -> не анализировался", output)
         self.assertIn("A -> B -> C -> A", output)
         self.assertIn("Пакетов в графе: 5", output)
+
+
+def reverse_graph_of(package: str, path: str, depth: int) -> dict:
+    """Строит граф обратных зависимостей пакета из тестового файла."""
+    resolver = make_test_resolver(path, package, reverse=True)
+    graph = build_graph(package, depth, resolver)
+    return {"nodes": graph.nodes, "cycles": graph.cycles}
+
+
+class TestReverse(unittest.TestCase):
+    """Тестирование режима обратных зависимостей."""
+
+    def test_reverse_repo(self) -> None:
+        """Тест переворота графа: пакет -> кто от него зависит."""
+        repo = {"A": ["B", "C"], "B": ["C"], "C": []}
+        self.assertEqual(reverse_repo(repo), {"B": ["A"], "C": ["A", "B"]})
+
+    def test_shared_dependency(self) -> None:
+        """Тест: от D зависят B и C напрямую и A транзитивно."""
+        result = reverse_graph_of("D", TEST_REPO, 3)
+        self.assertEqual(result["nodes"], {"D": ["B", "C"], "B": ["A"],
+                                           "A": [], "C": ["A"]})
+
+    def test_direct_and_transitive(self) -> None:
+        """Тест прямых и транзитивных обратных зависимостей."""
+        result = reverse_graph_of("L", LIBRARY_REPO, 10)
+        self.assertEqual(set(result["nodes"]),
+                         {"L", "A", "B", "C", "D", "E", "F", "G"})
+        self.assertEqual(result["nodes"]["L"], ["B", "D", "E"])
+
+    def test_max_depth(self) -> None:
+        """Тест ограничения глубины: только прямые обратные зависимости."""
+        result = reverse_graph_of("L", LIBRARY_REPO, 1)
+        self.assertEqual(result["nodes"], {"L": ["B", "D", "E"], "B": None,
+                                           "D": None, "E": None})
+
+    def test_no_dependents(self) -> None:
+        """Тест пакета, от которого никто не зависит."""
+        self.assertEqual(reverse_graph_of("F", LIBRARY_REPO, 3)["nodes"],
+                         {"F": []})
+
+    def test_cycles(self) -> None:
+        """Тест циклов в графе обратных зависимостей."""
+        result = reverse_graph_of("E", CYCLE_REPO, 3)
+        self.assertIn(["E", "E"], result["cycles"])
+        self.assertIn(["A", "C", "B", "A"], result["cycles"])
+
+    def test_validate_reverse(self) -> None:
+        """Тест: режим обратных зависимостей только для тестового режима."""
+        self.assertIsNone(validate_reverse(True, True))
+        self.assertIsNone(validate_reverse(False, False))
+        self.assertIsNotNone(validate_reverse(True, False))
+
+    def test_main_output(self) -> None:
+        """Тест вывода обратных зависимостей на экран."""
+        code, output = run_main(["-p", "D", "-r", TEST_REPO, "-t", "-R"])
+        self.assertEqual(code, 0)
+        self.assertIn("Обратные зависимости пакета D", output)
+        self.assertIn("D <- B, C", output)
+        self.assertIn("Пакетов, зависящих от D: 3", output)
 
 
 class TestMain(unittest.TestCase):

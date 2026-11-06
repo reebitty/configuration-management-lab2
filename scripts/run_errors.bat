@@ -43,3 +43,9 @@ python %MAIN% --package Serilog --repo https://example.com/
 echo.
 echo === 14. Repository host is unreachable ===
 python %MAIN% --package Serilog --repo https://no-such-host.invalid/index.json
+echo.
+echo === 15. Package not found in test repository ===
+python %MAIN% --package Z --repo "%~dp0..\repos\test_repo.txt" --test-mode
+echo.
+echo === 16. Invalid test repository file ===
+python %MAIN% --package A --repo "%~dp0..\repos\invalid.txt" --test-mode

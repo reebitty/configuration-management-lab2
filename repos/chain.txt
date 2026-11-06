@@ -1,0 +1,7 @@
+# Long chain of dependencies to check the maximum depth
+A: B
+B: C
+C: D
+D: E
+E: F
+F:

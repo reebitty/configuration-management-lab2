@@ -34,3 +34,12 @@ python %MAIN% --package Newtonsoft.Json --repo %URL% --max-depth 0
 echo.
 echo === 11. Several errors at once ===
 python %MAIN% --package "bad name!" --repo nuget --output graph.png --max-depth -5
+echo.
+echo === 12. Package not found in repository ===
+python %MAIN% --package NoSuchPackageXyz123 --repo %URL%
+echo.
+echo === 13. URL is not a NuGet service index ===
+python %MAIN% --package Serilog --repo https://example.com/
+echo.
+echo === 14. Repository host is unreachable ===
+python %MAIN% --package Serilog --repo https://no-such-host.invalid/index.json

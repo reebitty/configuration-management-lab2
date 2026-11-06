@@ -72,6 +72,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=str(DEFAULT_MAX_DEPTH),
                         help="максимальная глубина анализа зависимостей "
                              f"(по умолчанию {DEFAULT_MAX_DEPTH})")
+    parser.add_argument("-R", "--reverse", action="store_true",
+                        help="вывод обратных зависимостей: пакетов, "
+                             "которые зависят от заданного пакета "
+                             "(только с --test-mode)")
     return parser.parse_args(argv)
 
 
@@ -133,6 +137,14 @@ def validate_max_depth(value: str) -> str | None:
     return None
 
 
+def validate_reverse(reverse: bool, test_mode: bool) -> str | None:
+    """Проверяет, что обратные зависимости ищутся в тестовом репозитории."""
+    if reverse and not test_mode:
+        return ("режим обратных зависимостей поддерживается только для "
+                "тестового репозитория: укажите --test-mode (--reverse)")
+    return None
+
+
 def validate_args(args: argparse.Namespace) -> list[str]:
     """Проверяет все параметры и возвращает список ошибок."""
     errors = [
@@ -140,6 +152,7 @@ def validate_args(args: argparse.Namespace) -> list[str]:
         validate_repo(args.repo, args.test_mode),
         validate_output(args.output),
         validate_max_depth(args.max_depth),
+        validate_reverse(args.reverse, args.test_mode),
     ]
     return [error for error in errors if error]
 
@@ -282,9 +295,22 @@ def load_test_repo(path: str) -> dict[str, list[str]]:
     return repo
 
 
-def make_test_resolver(path: str,
-                       package: str) -> Callable[[str], list[str]]:
-    """Создает функцию получения зависимостей из тестового репозитория."""
+def reverse_repo(repo: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Переворачивает граф: пакет -> пакеты, которые от него зависят."""
+    dependents: dict[str, list[str]] = {}
+    for name, dependencies in repo.items():
+        for dependency in dependencies:
+            dependents.setdefault(dependency, []).append(name)
+    return {name: sorted(names) for name, names in dependents.items()}
+
+
+def make_test_resolver(path: str, package: str,
+                       reverse: bool = False) -> Callable[[str], list[str]]:
+    """Создает функцию получения зависимостей из тестового репозитория.
+
+    При reverse=True функция возвращает обратные зависимости: пакеты,
+    которые напрямую зависят от заданного пакета.
+    """
     repo = load_test_repo(path)
     known = set(repo)
     for dependencies in repo.values():
@@ -292,6 +318,8 @@ def make_test_resolver(path: str,
     if package not in known:
         raise RepoError(f"пакет '{package}' не найден в тестовом "
                         "репозитории")
+    if reverse:
+        repo = reverse_repo(repo)
     return lambda name: repo.get(name, [])
 
 
@@ -326,32 +354,65 @@ def visit(graph: DependencyGraph, package: str, depth: int,
     path.pop()
 
 
+def collect_cycles(graph: DependencyGraph, package: str, path: list[str],
+                   done: set[str]) -> None:
+    """Рекурсивно ищет циклы в построенном графе обходом в глубину."""
+    if package in path:
+        add_cycle(graph, path[path.index(package):] + [package])
+        return
+    if package in done:
+        return
+    path.append(package)
+    for dependency in graph.nodes.get(package) or []:
+        collect_cycles(graph, dependency, path, done)
+    path.pop()
+    done.add(package)
+
+
 def build_graph(package: str, max_depth: int,
                 get_dependencies: Callable[[str], list[str]]
                 ) -> DependencyGraph:
-    """Строит граф зависимостей пакета с учетом транзитивности."""
+    """Строит граф зависимостей пакета с учетом транзитивности.
+
+    После обхода граф проверяется еще раз, чтобы найти циклы, которые
+    видны в итоговом графе, но не лежали на одном пути при обходе
+    (например, из-за ограничения глубины).
+    """
     graph = DependencyGraph(max_depth)
     visit(graph, package, 0, [], get_dependencies)
+    done: set[str] = set()
+    for name in list(graph.nodes):
+        collect_cycles(graph, name, [], done)
     return graph
 
 
-def print_graph(package: str, graph: DependencyGraph) -> None:
-    """Выводит граф зависимостей и найденные циклы."""
-    print(f"Граф зависимостей пакета {package} "
+def print_graph(package: str, graph: DependencyGraph,
+                reverse: bool = False) -> None:
+    """Выводит граф зависимостей (или обратных зависимостей) и циклы.
+
+    В режиме обратных зависимостей запись 'X <- Y, Z' означает,
+    что пакеты Y и Z зависят от пакета X.
+    """
+    title = "Обратные зависимости" if reverse else "Граф зависимостей"
+    arrow = " <- " if reverse else " -> "
+    print(f"{title} пакета {package} "
           f"(максимальная глубина: {graph.max_depth})")
     for name, dependencies in graph.nodes.items():
         if dependencies is None:
-            print(f"  {name} -> не анализировался "
+            print(f"  {name}{arrow}не анализировался "
                   "(достигнута максимальная глубина)")
         else:
-            print(f"  {name} -> {', '.join(dependencies) or 'нет'}")
-    print(f"Пакетов в графе: {len(graph.nodes)}")
+            print(f"  {name}{arrow}{', '.join(dependencies) or 'нет'}")
+    if reverse:
+        print(f"Пакетов, зависящих от {package}: {len(graph.nodes) - 1}")
+    else:
+        print(f"Пакетов в графе: {len(graph.nodes)}")
     if not graph.cycles:
         print("Циклические зависимости: нет")
         return
     print(f"Циклические зависимости ({len(graph.cycles)}):")
     for cycle in graph.cycles:
-        print("  " + " -> ".join(cycle))
+        print("  " + arrow.join(cycle))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,14 +425,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         if args.test_mode:
-            resolver = make_test_resolver(args.repo, args.package)
+            resolver = make_test_resolver(args.repo, args.package,
+                                          args.reverse)
         else:
             resolver = make_nuget_resolver(args.repo)
         graph = build_graph(args.package, int(args.max_depth), resolver)
     except (NuGetError, RepoError) as error:
         print(f"Ошибка: {error}")
         return 1
-    print_graph(args.package, graph)
+    print_graph(args.package, graph, args.reverse)
     return 0
 
 

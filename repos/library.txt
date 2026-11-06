@@ -1,0 +1,10 @@
+# Library L is used by several packages directly (B, D, E)
+# and transitively (A through B and C, C through D, F through A).
+# Package G does not depend on L.
+A: B C
+B: L
+C: D
+D: L
+E: L
+F: A
+G: E
